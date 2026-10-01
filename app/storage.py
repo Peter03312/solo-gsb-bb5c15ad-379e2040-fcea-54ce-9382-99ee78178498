@@ -24,11 +24,13 @@ Two backends implement exactly the same contract:
 
 * :class:`EventStore` — process-local, resettable in-memory storage;
 * :class:`SqliteEventStore` — durable SQLite storage (WAL). Revisions,
-  idempotency-key mappings and frozen seal evidence survive process restarts
-  and are shared by several service processes pointed at the same database
-  file. Every mutating operation (including the revision/key pair insert and
-  the validate-then-freeze seal capture) runs in one ``BEGIN IMMEDIATE``
-  transaction, which is also the cross-process critical section.
+  idempotency-key mappings, frozen seal evidence and committed package
+  records survive process restarts and are shared by several service
+  processes pointed at the same database file. Every mutating operation
+  (including the revision/key pair insert, the validate-then-freeze seal
+  capture and the all-or-nothing package commit) runs in one
+  ``BEGIN IMMEDIATE`` transaction, which is also the cross-process critical
+  section.
 
 Both backends expose :meth:`BaseEventStore.transaction`, a reentrant
 in-process critical section that, for SQLite, holds one cross-process write
@@ -51,6 +53,7 @@ from .models import ROOT_PARENT
 
 __all__ = [
     "BatchStore",
+    "PackageRecord",
     "SealRecord",
     "StoredEvent",
     "IdempotencyConflict",
@@ -115,6 +118,24 @@ class SealRecord:
     evidence_digest: str
 
 
+@dataclass(frozen=True)
+class PackageRecord:
+    """One committed offline upload package: canonical content + frozen reply.
+
+    The frozen response lets an exact-content replay return the originally
+    committed per-item statuses, timeline hash and gaps verbatim, even after
+    later single submissions moved the live batch on. The record commits in
+    the same transaction as the package's revisions and idempotency keys.
+    """
+
+    batch_id: str
+    package_id: str
+    # Order-independent canonical form of the full package content.
+    content: str
+    # Frozen first-commit response payload (items/timeline_hash/gaps).
+    response: dict
+
+
 # ---------------------------------------------------------------------------
 # Deterministic serialization helpers
 # ---------------------------------------------------------------------------
@@ -136,6 +157,22 @@ def canonical_event(event: StoredEvent) -> str:
             unit,
             "1" if event.withdrawn else "0",
         ]
+    )
+
+
+def canonical_package(events: list[StoredEvent]) -> str:
+    """Order-independent canonical form of a package's full content.
+
+    A package merges as an unordered set (in-package parents may be listed
+    after their children), so the content identity sorts the per-revision
+    canonical payloads; each revision's idempotency key is part of its
+    submitted content.
+    """
+    return "\n".join(
+        sorted(
+            f"{canonical_event(event)}|{event.idempotency_key}"
+            for event in events
+        )
     )
 
 
@@ -196,6 +233,16 @@ class BaseEventStore:
     def add_seal(self, record: SealRecord) -> None:
         raise NotImplementedError
 
+    # -- packages -----------------------------------------------------------
+
+    def get_package(
+        self, batch_id: str, package_id: str
+    ) -> Optional[PackageRecord]:
+        raise NotImplementedError
+
+    def add_package(self, record: PackageRecord) -> None:
+        raise NotImplementedError
+
     # -- reads --------------------------------------------------------------
 
     def has_batch(self, batch_id: str) -> bool:
@@ -224,6 +271,8 @@ class EventStore(BaseEventStore):
         self._batches: dict[str, BatchStore] = defaultdict(BatchStore)
         # batch_id -> seal_id -> frozen archival evidence
         self._seals: dict[str, dict[str, SealRecord]] = defaultdict(dict)
+        # batch_id -> package_id -> committed package record
+        self._packages: dict[str, dict[str, PackageRecord]] = defaultdict(dict)
 
     @property
     def lock(self) -> threading.RLock:
@@ -291,6 +340,7 @@ class EventStore(BaseEventStore):
             seals_removed = sum(len(s) for s in self._seals.values())
             self._batches.clear()
             self._seals.clear()
+            self._packages.clear()
             return batches_removed, events_removed, seals_removed
 
     # -- seals --------------------------------------------------------------
@@ -302,6 +352,18 @@ class EventStore(BaseEventStore):
     def add_seal(self, record: SealRecord) -> None:
         with self._lock:
             self._seals[record.batch_id][record.seal_id] = record
+
+    # -- packages -----------------------------------------------------------
+
+    def get_package(
+        self, batch_id: str, package_id: str
+    ) -> Optional[PackageRecord]:
+        with self._lock:
+            return self._packages.get(batch_id, {}).get(package_id)
+
+    def add_package(self, record: PackageRecord) -> None:
+        with self._lock:
+            self._packages[record.batch_id][record.package_id] = record
 
     # -- reads --------------------------------------------------------------
 
@@ -351,6 +413,14 @@ CREATE TABLE IF NOT EXISTS seals (
     evidence        TEXT NOT NULL,
     evidence_digest TEXT NOT NULL,
     PRIMARY KEY (batch_id, seal_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS packages (
+    batch_id        TEXT NOT NULL,
+    package_id      TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    response        TEXT NOT NULL,
+    PRIMARY KEY (batch_id, package_id)
 ) WITHOUT ROWID;
 """
 
@@ -651,6 +721,7 @@ class SqliteEventStore(BaseEventStore):
                 cur.execute("DELETE FROM events")
                 cur.execute("DELETE FROM idempotency_keys")
                 cur.execute("DELETE FROM seals")
+                cur.execute("DELETE FROM packages")
                 return (
                     len(event_batches | seal_batches),
                     int(events_removed),
@@ -702,6 +773,53 @@ class SqliteEventStore(BaseEventStore):
             except sqlite3.Error as exc:
                 raise StorageError(
                     f"failed to persist seal {record.seal_id!r} of batch "
+                    f"{record.batch_id!r}: {exc}"
+                ) from exc
+
+    # -- packages -----------------------------------------------------------
+
+    def get_package(
+        self, batch_id: str, package_id: str
+    ) -> Optional[PackageRecord]:
+        with self.transaction(write=False):
+            cur = self._conn
+            assert cur is not None
+            try:
+                row = cur.execute(
+                    "SELECT * FROM packages WHERE batch_id = ? AND package_id = ?",
+                    (batch_id, package_id),
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise StorageError(
+                    f"failed to read package {package_id!r} of batch "
+                    f"{batch_id!r}: {exc}"
+                ) from exc
+            return None if row is None else _row_to_package(row)
+
+    def add_package(self, record: PackageRecord) -> None:
+        with self.transaction(write=True):
+            cur = self._conn
+            assert cur is not None
+            try:
+                cur.execute(
+                    "INSERT INTO packages "
+                    "(batch_id, package_id, content, response) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        record.batch_id,
+                        record.package_id,
+                        record.content,
+                        json.dumps(
+                            record.response,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+            except sqlite3.Error as exc:
+                raise StorageError(
+                    f"failed to persist package {record.package_id!r} of batch "
                     f"{record.batch_id!r}: {exc}"
                 ) from exc
 
@@ -776,6 +894,15 @@ def _row_to_seal(row: sqlite3.Row) -> SealRecord:
         timeline_hash=row["timeline_hash"],
         evidence=json.loads(row["evidence"]),
         evidence_digest=row["evidence_digest"],
+    )
+
+
+def _row_to_package(row: sqlite3.Row) -> PackageRecord:
+    return PackageRecord(
+        batch_id=row["batch_id"],
+        package_id=row["package_id"],
+        content=row["content"],
+        response=json.loads(row["response"]),
     )
 
 

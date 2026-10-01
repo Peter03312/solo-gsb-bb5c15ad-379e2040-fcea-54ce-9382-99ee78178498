@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -388,6 +389,150 @@ def test_api_storage_failure_returns_503(api_client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Offline-device packages on the durable backend
+# ---------------------------------------------------------------------------
+
+
+def _package_body(package_id, revisions, batch="B42"):
+    return {"batch_id": batch, "package_id": package_id, "revisions": revisions}
+
+
+def _pkg_rev(rev, parent, start, end, value=None, key=None, sensor="S1",
+             unit="C", withdrawn=False):
+    return {
+        "sensor_id": sensor,
+        "revision_id": rev,
+        "parent_id": parent,
+        "idempotency_key": key or f"k-{rev}",
+        "start_ns": start,
+        "end_ns": end,
+        "value": value,
+        "unit": unit,
+        "withdrawn": withdrawn,
+    }
+
+
+def _post_package(client, body, batch="B42"):
+    return client.post(f"/api/v1/batches/{batch}/packages", json=body)
+
+
+def test_api_package_survives_restart(api_client, db_path):
+    body = _package_body("PKG-1", [
+        _pkg_rev("v2", "v1", 100, 200, value=3.5, key="e2"),
+        _pkg_rev("v1", "ROOT", 0, 300, value=1.0, key="e1"),
+    ])
+    first = _post_package(api_client, body).json()
+    assert first["status"] == "accepted"
+
+    # A later single submission moves the live batch on.
+    _post_event(api_client, "v3", "v2", "e3", value=9.0, start=120, end=180)
+
+    restarted = _make_app_client(db_path)
+    with restarted:
+        # Exact replay after the restart returns the first saved result.
+        replay = _post_package(restarted, body).json()
+        assert replay["status"] == "duplicate"
+        assert replay["timeline_hash"] == first["timeline_hash"]
+        assert replay["items"] == first["items"]
+        assert replay["gaps"] == first["gaps"]
+
+        # Same package id with different content still conflicts.
+        diff = _post_package(restarted, _package_body("PKG-1", [
+            _pkg_rev("v1", "ROOT", 0, 300, value=1.0, key="e1"),
+        ]))
+        assert diff.status_code == 409
+
+        # The live batch reflects every committed revision.
+        result = restarted.get("/api/v1/batches/B42/result").json()
+        assert result["revisions_total"] == 3
+    main_module.store = create_store("memory")
+
+
+def test_api_package_rejection_leaves_no_trace(api_client):
+    _post_event(api_client, "v1", "ROOT", "e1", value=1.0)
+    conflict = _post_package(api_client, _package_body("PKG-1", [
+        _pkg_rev("v1", "ROOT", 0, 300, value=9.9, key="e9"),
+        _pkg_rev("v2", "v1", 100, 200, value=3.5, key="e2"),
+    ]))
+    assert conflict.status_code == 409
+    # Nothing was written and no package record remains: the same package id
+    # can be resubmitted with corrected content.
+    assert api_client.get("/api/v1/batches/B42/result").json()[
+        "revisions_total"
+    ] == 1
+    fixed = _post_package(api_client, _package_body("PKG-1", [
+        _pkg_rev("v1", "ROOT", 0, 300, value=1.0, key="e1"),
+        _pkg_rev("v2", "v1", 100, 200, value=3.5, key="e2"),
+    ]))
+    assert fixed.json()["status"] == "accepted"
+
+
+def test_api_reset_clears_packages(api_client):
+    body = _package_body("PKG-1", [
+        _pkg_rev("v1", "ROOT", 0, 300, value=1.0, key="e1"),
+    ])
+    assert _post_package(api_client, body).json()["status"] == "accepted"
+    api_client.post("/admin/reset")
+    assert _post_package(api_client, body).json()["status"] == "accepted"
+
+
+def test_concurrent_identical_packages_commit_exactly_once(api_client):
+    body = _package_body("PKG-RACE", [
+        _pkg_rev("v2", "v1", 100, 200, value=3.5, key="e2"),
+        _pkg_rev("v1", "ROOT", 0, 300, value=1.0, key="e1"),
+    ])
+
+    def submit(_):
+        # One client per thread; all share the same durable store.
+        with TestClient(main_module.app) as client:
+            return _post_package(client, body)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(submit, range(8)))
+
+    assert all(r.status_code == 200 for r in responses)
+    statuses = [r.json()["status"] for r in responses]
+    assert statuses.count("accepted") == 1
+    assert statuses.count("duplicate") == 7
+    # Every response reports the identical committed result.
+    assert len({r.json()["timeline_hash"] for r in responses}) == 1
+    assert api_client.get("/api/v1/batches/B42/result").json()[
+        "revisions_total"
+    ] == 2
+
+
+def test_concurrent_conflicting_packages_have_one_winner(api_client):
+    body_a = _package_body("PKG-RACE", [
+        _pkg_rev("v1", "ROOT", 0, 300, value=1.0, key="e1"),
+    ])
+    body_b = _package_body("PKG-RACE", [
+        _pkg_rev("v1", "ROOT", 0, 300, value=9.9, key="e9"),
+    ])
+    bodies = [body_a, body_b] * 4
+
+    def submit(body):
+        with TestClient(main_module.app) as client:
+            return _post_package(client, body)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(submit, bodies))
+
+    winners = [r for r in responses if r.status_code == 200]
+    losers = [r for r in responses if r.status_code == 409]
+    # Exactly one content wins: one accepted, its replays duplicate; every
+    # submission of the other content conflicts.
+    assert len(winners) == 4
+    assert len(losers) == 4
+    statuses = [r.json()["status"] for r in winners]
+    assert statuses.count("accepted") == 1
+    assert statuses.count("duplicate") == 3
+    assert len({r.json()["timeline_hash"] for r in winners}) == 1
+    assert api_client.get("/api/v1/batches/B42/result").json()[
+        "revisions_total"
+    ] == 1
+
+
+# ---------------------------------------------------------------------------
 # True multi-process sharing (two OS processes, one SQLite file)
 # ---------------------------------------------------------------------------
 
@@ -460,6 +605,78 @@ def test_two_os_processes_share_state(db_path):
     assert r["dup"] == "duplicate"
     assert r["digest"] == w["digest"]
     assert r["consistent"] is True
+
+
+_PACKAGE_HELPER = r"""
+import os, sys, json
+sys.path.insert(0, %r)
+os.environ["CAL_STORAGE"] = "sqlite"
+os.environ["CAL_SQLITE_PATH"] = %r
+from fastapi.testclient import TestClient
+from app.main import app
+
+PACKAGE = {
+    "batch_id": "B77",
+    "package_id": "PKG-77",
+    "revisions": [
+        {"sensor_id": "S1", "revision_id": "v2", "parent_id": "v1",
+         "idempotency_key": "p2", "start_ns": 100, "end_ns": 200,
+         "value": 3.5, "unit": "C"},
+        {"sensor_id": "S1", "revision_id": "v1", "parent_id": "ROOT",
+         "idempotency_key": "p1", "start_ns": 0, "end_ns": 300,
+         "value": 1.0, "unit": "C"},
+    ],
+}
+
+phase = sys.argv[1]
+with TestClient(app) as c:
+    if phase == "writer":
+        r = c.post("/api/v1/batches/B77/packages", json=PACKAGE)
+        print(json.dumps({
+            "status": r.json()["status"], "hash": r.json()["timeline_hash"],
+        }))
+    elif phase == "reader":
+        # Exact replay through a second process -> first saved result.
+        replay = c.post("/api/v1/batches/B77/packages", json=PACKAGE)
+        # Same package id, different content -> conflict.
+        changed = dict(PACKAGE, revisions=PACKAGE["revisions"][:1])
+        conflict = c.post("/api/v1/batches/B77/packages", json=changed)
+        result = c.get("/api/v1/batches/B77/result").json()
+        print(json.dumps({
+            "status": replay.json()["status"],
+            "hash": replay.json()["timeline_hash"],
+            "conflict": conflict.status_code,
+            "revisions": result["revisions_total"],
+            "complete": result["complete"],
+        }))
+"""
+
+
+def test_two_os_processes_share_packages(db_path):
+    workspace = str(Path(__file__).resolve().parents[1])
+    helper = (_PACKAGE_HELPER % (workspace, db_path)).encode("utf-8")
+
+    writer = subprocess.run(
+        [sys.executable, "-c", helper, "writer"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    w = json.loads(writer.stdout.strip().splitlines()[-1])
+    assert w["status"] == "accepted"
+
+    reader = subprocess.run(
+        [sys.executable, "-c", helper, "reader"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    r = json.loads(reader.stdout.strip().splitlines()[-1])
+    assert r["status"] == "duplicate"
+    assert r["hash"] == w["hash"]
+    assert r["conflict"] == 409
+    assert r["revisions"] == 2
+    assert r["complete"] is True
 
 
 def test_two_uvicorn_workers_share_state(db_path):

@@ -33,6 +33,8 @@ from .models import (
     MajorityRequest,
     MajorityResponse,
     MeasurementEvent,
+    PackageRequest,
+    PackageResponse,
     PreviewResponse,
     QualityGateRequest,
     QualityGateResponse,
@@ -48,9 +50,11 @@ from .models import (
 from .storage import (
     BatchStore,
     IdempotencyConflict,
+    PackageRecord,
     SealRecord,
     StorageError,
     StoredEvent,
+    canonical_package,
     create_store,
 )
 
@@ -187,6 +191,101 @@ def submit_event(batch_id: str, event: MeasurementEvent) -> IngestResponse:
         sensor_id=event.sensor_id,
         revision_id=event.revision_id,
         result=BatchResult(**result),
+    )
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/packages",
+    response_model=PackageResponse,
+    status_code=200,
+    tags=["calibration"],
+    summary="Atomically submit one offline-device package of revisions",
+    responses={
+        409: {"description": "Package id reused with other content, or a "
+                             "revision conflicts with stored data"},
+    },
+)
+def submit_package(batch_id: str, package: PackageRequest) -> PackageResponse:
+    if package.batch_id != batch_id:
+        raise HTTPException(
+            status_code=422,
+            detail="batch_id in path and body must match",
+        )
+    events = [
+        StoredEvent(
+            batch_id=package.batch_id,
+            sensor_id=revision.sensor_id,
+            revision_id=revision.revision_id,
+            parent_id=revision.parent_id,
+            idempotency_key=revision.idempotency_key,
+            start_ns=revision.start_ns,
+            end_ns=revision.end_ns,
+            value=None if revision.withdrawn else float(revision.value),
+            unit=revision.unit,
+            withdrawn=revision.withdrawn,
+        )
+        for revision in package.revisions
+    ]
+    content = canonical_package(events)
+    # One cross-process transaction for the whole package: replay check,
+    # per-revision classification, all writes, the evaluation and the package
+    # record commit atomically — a rejected package leaves no trace at all.
+    with store.transaction(write=True):
+        existing = store.get_package(batch_id, package.package_id)
+        if existing is not None:
+            if existing.content == content:
+                # Exact replay: return the first saved result verbatim, even
+                # if later single submissions moved the live batch on.
+                return PackageResponse(
+                    status="duplicate",
+                    batch_id=batch_id,
+                    package_id=package.package_id,
+                    **existing.response,
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"package {package.package_id!r} already exists for batch "
+                    f"{batch_id!r} with different content"
+                ),
+            )
+        # Classify every revision before writing anything: any conflict with
+        # a stored revision or idempotency key rejects the whole package
+        # (in-package duplicates are already rejected by request validation),
+        # so a refused package never writes a partial state.
+        for event in events:
+            store.classify_submission(event)
+        items = []
+        for event in events:
+            status = store.add(event)
+            items.append(
+                {
+                    "sensor_id": event.sensor_id,
+                    "revision_id": event.revision_id,
+                    "idempotency_key": event.idempotency_key,
+                    "status": status,
+                }
+            )
+        batch = store.get_batch(batch_id)
+        result = evaluate_batch(batch_id, batch)
+        response = {
+            "items": items,
+            "timeline_hash": result["timeline_hash"],
+            "gaps": result["gaps"],
+        }
+        store.add_package(
+            PackageRecord(
+                batch_id=batch_id,
+                package_id=package.package_id,
+                content=content,
+                response=response,
+            )
+        )
+    return PackageResponse(
+        status="accepted",
+        batch_id=batch_id,
+        package_id=package.package_id,
+        **response,
     )
 
 

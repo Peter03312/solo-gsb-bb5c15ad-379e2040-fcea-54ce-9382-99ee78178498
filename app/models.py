@@ -18,6 +18,7 @@ SensorId = Annotated[str, Field(min_length=1, max_length=200)]
 IdemKey = Annotated[str, Field(min_length=1, max_length=200)]
 UnitName = Annotated[str, Field(min_length=1, max_length=40)]
 SealId = Annotated[str, Field(min_length=1, max_length=200)]
+PackageId = Annotated[str, Field(min_length=1, max_length=200)]
 # SHA-256 hex digest, exactly as emitted in a batch result's timeline_hash.
 TimelineHash = Annotated[str, Field(pattern="^[0-9a-f]{64}$")]
 
@@ -97,6 +98,94 @@ class BatchResult(StrictModel):
     # True when every known revision is grounded (no gaps, no cycles).
     complete: bool
     timeline_hash: str
+
+
+class PackageRevision(StrictModel):
+    """One measurement-fragment revision inside an offline upload package.
+
+    Same field rules as :class:`MeasurementEvent`, except the batch is
+    inherited from the enclosing package (the package's ``batch_id``).
+    """
+
+    sensor_id: SensorId
+    revision_id: VersionId
+    # Parent revision for this sensor; the literal "ROOT" marks a causal root.
+    parent_id: VersionId
+    idempotency_key: IdemKey
+    start_ns: int = Field(ge=0)
+    end_ns: int = Field(ge=1)
+    # Calibration value for the fragment; required unless the fragment is
+    # withdrawn (withdrawn fragments erase instead of writing a value).
+    value: Optional[float] = None
+    unit: Optional[str] = Field(default=None, max_length=40)
+    withdrawn: bool = False
+
+    @model_validator(mode="after")
+    def _check_interval_and_value(self) -> "PackageRevision":
+        if self.revision_id == ROOT_PARENT:
+            raise ValueError(f"revision_id may not be the reserved value {ROOT_PARENT!r}")
+        if self.end_ns <= self.start_ns:
+            raise ValueError("end_ns must be strictly greater than start_ns")
+        if not self.withdrawn and self.value is None:
+            raise ValueError("value is required when withdrawn is false")
+        return self
+
+
+class PackageRequest(StrictModel):
+    """One atomic upload package of revisions from an offline device.
+
+    Parent/child revisions inside the package may be listed in any order;
+    the whole package is merged first and folded by causality. Duplicate
+    revision ids or idempotency keys inside the package reject it entirely.
+    """
+
+    batch_id: BatchId
+    # Caller-chosen package identifier, unique per batch; an exact-content
+    # replay returns the first saved result, different content conflicts.
+    package_id: PackageId
+    revisions: list[PackageRevision] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_unique_ids(self) -> "PackageRequest":
+        revision_ids = [r.revision_id for r in self.revisions]
+        if len(revision_ids) != len(set(revision_ids)):
+            raise ValueError(
+                "revisions must not contain duplicate revision_id entries"
+            )
+        keys = [r.idempotency_key for r in self.revisions]
+        if len(keys) != len(set(keys)):
+            raise ValueError(
+                "revisions must not contain duplicate idempotency_key entries"
+            )
+        return self
+
+
+class PackageItemResult(StrictModel):
+    """Per-revision ingest outcome of one committed package."""
+
+    sensor_id: str
+    revision_id: str
+    idempotency_key: str
+    # accepted:  newly stored by this package;
+    # duplicate: an identical revision was already stored (a fresh
+    #            idempotency key is registered for it).
+    status: Literal["accepted", "duplicate"]
+
+
+class PackageResponse(StrictModel):
+    """Result of an atomic package upload (or of its exact replay)."""
+
+    # accepted:  the package was committed by this request;
+    # duplicate: an identical package was committed before; the returned
+    #            items/timeline_hash/gaps are the first saved result, even
+    #            if later single submissions moved the live batch on.
+    status: Literal["accepted", "duplicate"]
+    batch_id: str
+    package_id: str
+    items: list[PackageItemResult]
+    # Batch timeline hash and gap list as committed by this package.
+    timeline_hash: str
+    gaps: list[Gap] = Field(default_factory=list)
 
 
 class SamplePointResponse(StrictModel):
