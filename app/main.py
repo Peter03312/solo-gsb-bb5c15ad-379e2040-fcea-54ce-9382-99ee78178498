@@ -1,4 +1,4 @@
-"""FastAPI application: ingest, preview, query, evaluation, seal and reset endpoints."""
+"""FastAPI application: ingest, package upload, preview, query, evaluation, seal and reset endpoints."""
 
 from __future__ import annotations
 
@@ -33,6 +33,8 @@ from .models import (
     MajorityRequest,
     MajorityResponse,
     MeasurementEvent,
+    PackageRequest,
+    PackageResponse,
     PreviewResponse,
     QualityGateRequest,
     QualityGateResponse,
@@ -48,9 +50,11 @@ from .models import (
 from .storage import (
     BatchStore,
     IdempotencyConflict,
+    PackageRecord,
     SealRecord,
     StorageError,
     StoredEvent,
+    canonical_package,
     create_store,
 )
 
@@ -188,6 +192,94 @@ def submit_event(batch_id: str, event: MeasurementEvent) -> IngestResponse:
         revision_id=event.revision_id,
         result=BatchResult(**result),
     )
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/packages",
+    response_model=PackageResponse,
+    status_code=200,
+    tags=["calibration"],
+    summary="Submit one atomic package of measurement-fragment revisions",
+    responses={
+        409: {
+            "description": "Package id reused with different content, or a "
+            "revision conflicts with stored revisions/idempotency keys"
+        },
+    },
+)
+def submit_package(batch_id: str, package: PackageRequest) -> PackageResponse:
+    if package.batch_id != batch_id:
+        raise HTTPException(
+            status_code=422,
+            detail="batch_id in path and body must match",
+        )
+    stored_events = [
+        StoredEvent(
+            batch_id=batch_id,
+            sensor_id=rev.sensor_id,
+            revision_id=rev.revision_id,
+            parent_id=rev.parent_id,
+            idempotency_key=rev.idempotency_key,
+            start_ns=rev.start_ns,
+            end_ns=rev.end_ns,
+            value=None if rev.withdrawn else float(rev.value),
+            unit=rev.unit,
+            withdrawn=rev.withdrawn,
+        )
+        for rev in package.revisions
+    ]
+    fingerprint = canonical_package(stored_events)
+    # One cross-process transaction for the whole package: the replay check,
+    # conflict classification, revision+key writes, package record and the
+    # post-commit evaluation commit (or roll back) atomically, so a package
+    # either lands completely or not at all — under concurrent processes and
+    # across restarts alike.
+    with store.transaction(write=True):
+        existing = store.get_package(batch_id, package.package_id)
+        if existing is not None:
+            if existing.canonical == fingerprint:
+                # Exact retry of a committed package: return the first-saved
+                # result verbatim, even if single revisions arrived since.
+                return PackageResponse(status="duplicate", **existing.response)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"package {package.package_id!r} already exists for batch "
+                    f"{batch_id!r} with different content"
+                ),
+            )
+        # Phase 1 (no writes): classify every revision against the stored
+        # state; any conflict rejects the whole package and the transaction
+        # rolls back with nothing persisted.
+        for stored in stored_events:
+            store.classify_submission(stored)
+        # Phase 2: every revision is known to apply cleanly; write them all.
+        statuses = [store.add(stored) for stored in stored_events]
+        batch = store.get_batch(batch_id)
+        result = evaluate_batch(batch_id, batch)
+        response_doc = {
+            "batch_id": batch_id,
+            "package_id": package.package_id,
+            "revisions": [
+                {
+                    "sensor_id": stored.sensor_id,
+                    "revision_id": stored.revision_id,
+                    "idempotency_key": stored.idempotency_key,
+                    "status": status,
+                }
+                for stored, status in zip(stored_events, statuses)
+            ],
+            "result": result,
+        }
+        store.add_package(
+            PackageRecord(
+                batch_id=batch_id,
+                package_id=package.package_id,
+                canonical=fingerprint,
+                response=response_doc,
+            )
+        )
+    return PackageResponse(status="accepted", **response_doc)
 
 
 @app.post(
@@ -573,19 +665,21 @@ def recall_seal(batch_id: str, seal_id: str) -> SealRecallResponse:
     "/admin/reset",
     response_model=ResetResponse,
     tags=["ops"],
-    summary="Clear all batches, events and seals",
+    summary="Clear all batches, events, seals and packages",
 )
 def reset_state() -> ResetResponse:
-    batches_removed, events_removed, seals_removed = store.reset()
+    batches_removed, events_removed, seals_removed, packages_removed = store.reset()
     logger.warning(
-        "state reset: removed %d events across %d batches and %d seals",
+        "state reset: removed %d events across %d batches, %d seals and %d packages",
         events_removed,
         batches_removed,
         seals_removed,
+        packages_removed,
     )
     return ResetResponse(
         status="reset",
         batches_removed=batches_removed,
         events_removed=events_removed,
         seals_removed=seals_removed,
+        packages_removed=packages_removed,
     )

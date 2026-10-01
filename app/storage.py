@@ -51,12 +51,14 @@ from .models import ROOT_PARENT
 
 __all__ = [
     "BatchStore",
+    "PackageRecord",
     "SealRecord",
     "StoredEvent",
     "IdempotencyConflict",
     "StorageError",
     "EventStore",
     "SqliteEventStore",
+    "canonical_package",
     "create_store",
 ]
 
@@ -115,6 +117,24 @@ class SealRecord:
     evidence_digest: str
 
 
+@dataclass(frozen=True)
+class PackageRecord:
+    """One atomically committed upload package, kept for exact-retry replay.
+
+    ``canonical`` is the normalized content fingerprint used to tell an
+    exact retry apart from a content-changing resubmission under the same
+    package id. ``response`` is the plain-data response document saved when
+    the package first committed (per-revision statuses plus the batch result
+    evaluated on the post-commit snapshot); it is returned verbatim on every
+    exact replay, even if single revisions have arrived since.
+    """
+
+    batch_id: str
+    package_id: str
+    canonical: str
+    response: dict
+
+
 # ---------------------------------------------------------------------------
 # Deterministic serialization helpers
 # ---------------------------------------------------------------------------
@@ -136,6 +156,21 @@ def canonical_event(event: StoredEvent) -> str:
             unit,
             "1" if event.withdrawn else "0",
         ]
+    )
+
+
+def canonical_package(events: list[StoredEvent]) -> str:
+    """Canonical content fingerprint of one whole upload package.
+
+    Every request field of every revision contributes, including each
+    idempotency key: resubmitting the same revisions under different keys is
+    *different* content and conflicts. The revision order inside the package
+    is normalized away, so a retry may list parents and children in any
+    order.
+    """
+    return "\n".join(
+        f"{event.idempotency_key}={canonical_event(event)}"
+        for event in sorted(events, key=lambda e: (e.sensor_id, e.revision_id))
     )
 
 
@@ -184,8 +219,8 @@ class BaseEventStore:
         """
         raise NotImplementedError
 
-    def reset(self) -> tuple[int, int, int]:
-        """Clear every batch, event and seal; return their counts."""
+    def reset(self) -> tuple[int, int, int, int]:
+        """Clear every batch, event, seal and package; return their counts."""
         raise NotImplementedError
 
     # -- seals --------------------------------------------------------------
@@ -194,6 +229,14 @@ class BaseEventStore:
         raise NotImplementedError
 
     def add_seal(self, record: SealRecord) -> None:
+        raise NotImplementedError
+
+    # -- packages -----------------------------------------------------------
+
+    def get_package(self, batch_id: str, package_id: str) -> Optional[PackageRecord]:
+        raise NotImplementedError
+
+    def add_package(self, record: PackageRecord) -> None:
         raise NotImplementedError
 
     # -- reads --------------------------------------------------------------
@@ -224,6 +267,8 @@ class EventStore(BaseEventStore):
         self._batches: dict[str, BatchStore] = defaultdict(BatchStore)
         # batch_id -> seal_id -> frozen archival evidence
         self._seals: dict[str, dict[str, SealRecord]] = defaultdict(dict)
+        # batch_id -> package_id -> committed package record
+        self._packages: dict[str, dict[str, PackageRecord]] = defaultdict(dict)
 
     @property
     def lock(self) -> threading.RLock:
@@ -284,14 +329,16 @@ class EventStore(BaseEventStore):
 
             return "submittable"
 
-    def reset(self) -> tuple[int, int, int]:
+    def reset(self) -> tuple[int, int, int, int]:
         with self._lock:
             batches_removed = len(self._batches)
             events_removed = sum(len(b.events) for b in self._batches.values())
             seals_removed = sum(len(s) for s in self._seals.values())
+            packages_removed = sum(len(p) for p in self._packages.values())
             self._batches.clear()
             self._seals.clear()
-            return batches_removed, events_removed, seals_removed
+            self._packages.clear()
+            return batches_removed, events_removed, seals_removed, packages_removed
 
     # -- seals --------------------------------------------------------------
 
@@ -302,6 +349,16 @@ class EventStore(BaseEventStore):
     def add_seal(self, record: SealRecord) -> None:
         with self._lock:
             self._seals[record.batch_id][record.seal_id] = record
+
+    # -- packages -----------------------------------------------------------
+
+    def get_package(self, batch_id: str, package_id: str) -> Optional[PackageRecord]:
+        with self._lock:
+            return self._packages.get(batch_id, {}).get(package_id)
+
+    def add_package(self, record: PackageRecord) -> None:
+        with self._lock:
+            self._packages[record.batch_id][record.package_id] = record
 
     # -- reads --------------------------------------------------------------
 
@@ -351,6 +408,14 @@ CREATE TABLE IF NOT EXISTS seals (
     evidence        TEXT NOT NULL,
     evidence_digest TEXT NOT NULL,
     PRIMARY KEY (batch_id, seal_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS packages (
+    batch_id        TEXT NOT NULL,
+    package_id      TEXT NOT NULL,
+    canonical       TEXT NOT NULL,
+    response        TEXT NOT NULL,
+    PRIMARY KEY (batch_id, package_id)
 ) WITHOUT ROWID;
 """
 
@@ -625,7 +690,7 @@ class SqliteEventStore(BaseEventStore):
                     f"{event.batch_id!r}: {exc}"
                 ) from exc
 
-    def reset(self) -> tuple[int, int, int]:
+    def reset(self) -> tuple[int, int, int, int]:
         with self.transaction(write=True):
             cur = self._conn
             assert cur is not None
@@ -642,19 +707,30 @@ class SqliteEventStore(BaseEventStore):
                         "SELECT DISTINCT batch_id FROM seals"
                     ).fetchall()
                 }
+                package_batches = {
+                    r[0]
+                    for r in cur.execute(
+                        "SELECT DISTINCT batch_id FROM packages"
+                    ).fetchall()
+                }
                 events_removed = cur.execute(
                     "SELECT COUNT(*) FROM events"
                 ).fetchone()[0]
                 seals_removed = cur.execute(
                     "SELECT COUNT(*) FROM seals"
                 ).fetchone()[0]
+                packages_removed = cur.execute(
+                    "SELECT COUNT(*) FROM packages"
+                ).fetchone()[0]
                 cur.execute("DELETE FROM events")
                 cur.execute("DELETE FROM idempotency_keys")
                 cur.execute("DELETE FROM seals")
+                cur.execute("DELETE FROM packages")
                 return (
-                    len(event_batches | seal_batches),
+                    len(event_batches | seal_batches | package_batches),
                     int(events_removed),
                     int(seals_removed),
+                    int(packages_removed),
                 )
             except sqlite3.Error as exc:
                 raise StorageError(f"failed to reset sqlite storage: {exc}") from exc
@@ -702,6 +778,51 @@ class SqliteEventStore(BaseEventStore):
             except sqlite3.Error as exc:
                 raise StorageError(
                     f"failed to persist seal {record.seal_id!r} of batch "
+                    f"{record.batch_id!r}: {exc}"
+                ) from exc
+
+    # -- packages -----------------------------------------------------------
+
+    def get_package(self, batch_id: str, package_id: str) -> Optional[PackageRecord]:
+        with self.transaction(write=False):
+            cur = self._conn
+            assert cur is not None
+            try:
+                row = cur.execute(
+                    "SELECT * FROM packages WHERE batch_id = ? AND package_id = ?",
+                    (batch_id, package_id),
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise StorageError(
+                    f"failed to read package {package_id!r} of batch "
+                    f"{batch_id!r}: {exc}"
+                ) from exc
+            return None if row is None else _row_to_package(row)
+
+    def add_package(self, record: PackageRecord) -> None:
+        with self.transaction(write=True):
+            cur = self._conn
+            assert cur is not None
+            try:
+                cur.execute(
+                    "INSERT INTO packages "
+                    "(batch_id, package_id, canonical, response) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        record.batch_id,
+                        record.package_id,
+                        record.canonical,
+                        json.dumps(
+                            record.response,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+            except sqlite3.Error as exc:
+                raise StorageError(
+                    f"failed to persist package {record.package_id!r} of batch "
                     f"{record.batch_id!r}: {exc}"
                 ) from exc
 
@@ -776,6 +897,15 @@ def _row_to_seal(row: sqlite3.Row) -> SealRecord:
         timeline_hash=row["timeline_hash"],
         evidence=json.loads(row["evidence"]),
         evidence_digest=row["evidence_digest"],
+    )
+
+
+def _row_to_package(row: sqlite3.Row) -> PackageRecord:
+    return PackageRecord(
+        batch_id=row["batch_id"],
+        package_id=row["package_id"],
+        canonical=row["canonical"],
+        response=json.loads(row["response"]),
     )
 
 

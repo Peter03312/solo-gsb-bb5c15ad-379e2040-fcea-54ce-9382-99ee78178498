@@ -123,11 +123,11 @@ def test_reset_clears_and_counts(sqlite_store):
     sqlite_store.add(
         _event("v1", "ROOT", "k1", batch="B2", sensor="S2", value=4.0)
     )
-    assert sqlite_store.reset() == (2, 2, 0)
+    assert sqlite_store.reset() == (2, 2, 0, 0)
     assert sqlite_store.get_batch("B1") is None
     assert sqlite_store.get_batch("B2") is None
     # Resetting an already-empty store reports zeroes, not an error.
-    assert sqlite_store.reset() == (0, 0, 0)
+    assert sqlite_store.reset() == (0, 0, 0, 0)
 
 
 def test_seals_survive_restart_and_are_immutable(sqlite_store, db_path):
@@ -184,8 +184,37 @@ def test_reset_clears_seals(sqlite_store):
         SealRecord("B", "SEAL-1", evidence["result"]["timeline_hash"], evidence,
                    hash_seal_evidence(evidence))
     )
-    assert sqlite_store.reset() == (1, 1, 1)
+    assert sqlite_store.reset() == (1, 1, 1, 0)
     assert sqlite_store.get_seal("B", "SEAL-1") is None
+
+
+def test_packages_survive_restart_and_reset(sqlite_store, db_path):
+    from app.storage import PackageRecord, canonical_package
+
+    events = [
+        _event("v2", "v1", "k2", start=100, end=200, value=3.5),
+        _event("v1", "ROOT", "k1", start=0, end=300, value=1.0),
+    ]
+    for event in events:
+        sqlite_store.add(event)
+    record = PackageRecord(
+        batch_id="B",
+        package_id="PKG-1",
+        canonical=canonical_package(events),
+        response={"package_id": "PKG-1", "result": {"timeline_hash": "abc"}},
+    )
+    sqlite_store.add_package(record)
+
+    # A fresh store instance over the same file is a "restarted process".
+    restarted = SqliteEventStore(db_path)
+    loaded = restarted.get_package("B", "PKG-1")
+    assert loaded is not None
+    assert loaded.canonical == record.canonical
+    assert loaded.response == record.response
+    assert restarted.get_package("B", "other") is None
+
+    assert restarted.reset() == (1, 2, 0, 1)
+    assert restarted.get_package("B", "PKG-1") is None
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +416,92 @@ def test_api_storage_failure_returns_503(api_client, monkeypatch):
     assert "storage unavailable" in r.json()["detail"]
 
 
+def _package_body(*revs, batch="B42", package_id="PKG-1"):
+    return {"batch_id": batch, "package_id": package_id,
+            "revisions": list(revs)}
+
+
+def _pkg_rev(rev, parent, key, **kw):
+    return {
+        "sensor_id": kw.pop("sensor", "S1"),
+        "revision_id": rev,
+        "parent_id": parent,
+        "idempotency_key": key,
+        "start_ns": kw.pop("start", 0),
+        "end_ns": kw.pop("end", 300),
+        "value": kw.pop("value", 1.0),
+        "unit": kw.pop("unit", "C"),
+        "withdrawn": kw.pop("withdrawn", False),
+    }
+
+
+def test_api_package_retry_and_conflict_across_restart(api_client, db_path):
+    body = _package_body(
+        _pkg_rev("v2", "v1", "e2", start=100, end=200, value=3.5),
+        _pkg_rev("v1", "ROOT", "e1"),
+    )
+    first = api_client.post("/api/v1/batches/B42/packages", json=body).json()
+    assert first["status"] == "accepted"
+    assert first["result"]["complete"] is True
+
+    # A single revision arrives after the package committed.
+    _post_event(api_client, "v3", "v2", "e3", value=9.0, start=30, end=40)
+
+    # "Restart": a brand new client/store over the same database file.
+    restarted = _make_app_client(db_path)
+    with restarted:
+        # Exact retry after the restart returns the first-saved result,
+        # not the drifted live batch.
+        replay = restarted.post("/api/v1/batches/B42/packages", json=body)
+        assert replay.status_code == 200
+        assert replay.json()["status"] == "duplicate"
+        assert replay.json()["result"] == first["result"]
+        assert replay.json()["revisions"] == first["revisions"]
+
+        # Same package id with different content -> 409, nothing written.
+        changed = _package_body(_pkg_rev("v1", "ROOT", "e1", value=2.0))
+        assert restarted.post(
+            "/api/v1/batches/B42/packages", json=changed
+        ).status_code == 409
+        live = restarted.get("/api/v1/batches/B42/result").json()
+        assert live["revisions_total"] == 3
+    main_module.store = create_store("memory")
+
+
+def test_api_concurrent_identical_packages_commit_exactly_once(api_client):
+    """Concurrent identical uploads: one accepted, the rest duplicates."""
+    import threading
+
+    body = _package_body(
+        _pkg_rev("v2", "v1", "e2", start=100, end=200, value=3.5),
+        _pkg_rev("v1", "ROOT", "e1"),
+    )
+    barrier = threading.Barrier(4)
+    responses = []
+
+    def upload():
+        barrier.wait(timeout=10)
+        responses.append(
+            api_client.post("/api/v1/batches/B42/packages", json=body)
+        )
+
+    threads = [threading.Thread(target=upload) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+
+    assert all(r.status_code == 200 for r in responses)
+    statuses = sorted(r.json()["status"] for r in responses)
+    assert statuses == ["accepted", "duplicate", "duplicate", "duplicate"]
+    # Every response carries the same committed result.
+    results = {r.json()["result"]["timeline_hash"] for r in responses}
+    assert len(results) == 1
+    live = api_client.get("/api/v1/batches/B42/result").json()
+    assert live["revisions_total"] == 2
+
+
 # ---------------------------------------------------------------------------
 # True multi-process sharing (two OS processes, one SQLite file)
 # ---------------------------------------------------------------------------
@@ -404,12 +519,22 @@ def event(rev, parent, key, value=1.0, start=0, end=300):
             "idempotency_key":key,"start_ns":start,"end_ns":end,
             "value":value,"unit":"C","withdrawn":False}
 
+def pkg_rev(rev, parent, key, value=1.0, start=0, end=300):
+    body = event(rev, parent, key, value, start, end)
+    del body["batch_id"]
+    return body
+
+PKG = {"batch_id":"B77","package_id":"PKG-1",
+       "revisions":[pkg_rev("p2","p1","pk2",value=5.0,start=10,end=20),
+                    pkg_rev("p1","ROOT","pk1")]}
+
 phase = sys.argv[1]
 with TestClient(app) as c:
     if phase == "writer":
         r1 = c.post("/api/v1/batches/B77/events", json=event("v1","ROOT","w1"))
         r2 = c.post("/api/v1/batches/B77/events",
                     json=event("v2","v1","w2",value=3.5,start=100,end=200))
+        pkg = c.post("/api/v1/batches/B77/packages", json=PKG)
         h = c.get("/api/v1/batches/B77/result").json()["timeline_hash"]
         seal = c.post("/api/v1/batches/B77/seals",
                       json={"batch_id":"B77","seal_id":"S","timeline_hash":h})
@@ -417,18 +542,28 @@ with TestClient(app) as c:
             "r1": r1.json()["status"], "r2": r2.json()["status"],
             "seal": seal.json()["status"], "digest": seal.json()["evidence_digest"],
             "hash": h,
+            "pkg": pkg.json()["status"],
+            "pkg_hash": pkg.json()["result"]["timeline_hash"],
         }))
     elif phase == "reader":
         result = c.get("/api/v1/batches/B77/result").json()
         recall = c.get("/api/v1/batches/B77/seals/S").json()
         # Same payload through a second process -> duplicate.
         dup = c.post("/api/v1/batches/B77/events", json=event("v1","ROOT","w1"))
+        # Exact package retry through a second process -> first-saved result.
+        pkg = c.post("/api/v1/batches/B77/packages", json=PKG)
+        # Same package id, different content -> conflict.
+        changed = dict(PKG, revisions=[pkg_rev("p1","ROOT","pk1",value=2.0)])
+        conflict = c.post("/api/v1/batches/B77/packages", json=changed)
         print(json.dumps({
             "revisions": result["revisions_total"],
             "complete": result["complete"],
             "digest": recall["evidence_digest"],
             "consistent": recall["consistent"],
             "dup": dup.json()["status"],
+            "pkg": pkg.json()["status"],
+            "pkg_hash": pkg.json()["result"]["timeline_hash"],
+            "pkg_conflict": conflict.status_code,
         }))
 """
 
@@ -446,6 +581,7 @@ def test_two_os_processes_share_state(db_path):
     w = json.loads(writer.stdout.strip().splitlines()[-1])
     assert w["r1"] == "accepted" and w["r2"] == "accepted"
     assert w["seal"] == "sealed"
+    assert w["pkg"] == "accepted"
 
     # Completely separate OS process: must see revisions, keys and the seal.
     reader = subprocess.run(
@@ -455,11 +591,15 @@ def test_two_os_processes_share_state(db_path):
         check=True,
     )
     r = json.loads(reader.stdout.strip().splitlines()[-1])
-    assert r["revisions"] == 2
+    assert r["revisions"] == 4
     assert r["complete"] is True
     assert r["dup"] == "duplicate"
     assert r["digest"] == w["digest"]
     assert r["consistent"] is True
+    # The package record committed by the writer replays in the reader.
+    assert r["pkg"] == "duplicate"
+    assert r["pkg_hash"] == w["pkg_hash"]
+    assert r["pkg_conflict"] == 409
 
 
 def test_two_uvicorn_workers_share_state(db_path):

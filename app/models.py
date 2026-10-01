@@ -18,6 +18,7 @@ SensorId = Annotated[str, Field(min_length=1, max_length=200)]
 IdemKey = Annotated[str, Field(min_length=1, max_length=200)]
 UnitName = Annotated[str, Field(min_length=1, max_length=40)]
 SealId = Annotated[str, Field(min_length=1, max_length=200)]
+PackageId = Annotated[str, Field(min_length=1, max_length=200)]
 # SHA-256 hex digest, exactly as emitted in a batch result's timeline_hash.
 TimelineHash = Annotated[str, Field(pattern="^[0-9a-f]{64}$")]
 
@@ -26,10 +27,13 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class MeasurementEvent(StrictModel):
-    """One measurement-fragment revision delivered to the ingest endpoint."""
+class RevisionPayload(StrictModel):
+    """Fields of one measurement-fragment revision (batch supplied externally).
 
-    batch_id: BatchId
+    Shared validation for the single-event ingest payload and for revisions
+    nested inside an upload package.
+    """
+
     sensor_id: SensorId
     revision_id: VersionId
     # Parent revision for this sensor; the literal "ROOT" marks a causal root.
@@ -46,7 +50,7 @@ class MeasurementEvent(StrictModel):
     withdrawn: bool = False
 
     @model_validator(mode="after")
-    def _check_interval_and_value(self) -> "MeasurementEvent":
+    def _check_interval_and_value(self) -> "RevisionPayload":
         if self.revision_id == ROOT_PARENT:
             raise ValueError(f"revision_id may not be the reserved value {ROOT_PARENT!r}")
         if self.end_ns <= self.start_ns:
@@ -54,6 +58,12 @@ class MeasurementEvent(StrictModel):
         if not self.withdrawn and self.value is None:
             raise ValueError("value is required when withdrawn is false")
         return self
+
+
+class MeasurementEvent(RevisionPayload):
+    """One measurement-fragment revision delivered to the ingest endpoint."""
+
+    batch_id: BatchId
 
 
 class TimelineSegment(StrictModel):
@@ -545,6 +555,79 @@ class IngestResponse(StrictModel):
     result: BatchResult
 
 
+# ---------------------------------------------------------------------------
+# Atomic multi-revision packages (offline device upload)
+# ---------------------------------------------------------------------------
+
+
+class PackageRevision(RevisionPayload):
+    """One revision inside an upload package; the batch is inherited from the
+    enclosing package request."""
+
+
+class PackageRequest(StrictModel):
+    """One atomic package of measurement-fragment revisions from one batch.
+
+    Offline collection devices upload every revision of one acquisition run
+    in a single package. The package either commits as a whole or is rejected
+    as a whole: duplicate revision ids / idempotency keys inside the package
+    or any invalid revision reject it (422), and any conflict with already
+    stored revisions or idempotency keys rejects it with a conflict (409) —
+    in both cases nothing is written.
+    """
+
+    batch_id: BatchId
+    # Caller-chosen package identifier, unique per batch; an exact retry of a
+    # committed package returns the first-saved result, a different package
+    # body under the same id conflicts.
+    package_id: PackageId
+    # Revisions of the package (>= 1); parents and children may be listed in
+    # any order and are folded after the whole package is merged.
+    revisions: list[PackageRevision] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_unique_within_package(self) -> "PackageRequest":
+        revision_ids = [rev.revision_id for rev in self.revisions]
+        if len(revision_ids) != len(set(revision_ids)):
+            raise ValueError("revisions must not contain duplicate revision_id entries")
+        keys = [rev.idempotency_key for rev in self.revisions]
+        if len(keys) != len(set(keys)):
+            raise ValueError(
+                "revisions must not contain duplicate idempotency_key entries"
+            )
+        return self
+
+
+class PackageRevisionStatus(StrictModel):
+    """Per-revision outcome of an accepted package, in request order."""
+
+    sensor_id: str
+    revision_id: str
+    idempotency_key: str
+    # accepted:  newly stored by this package;
+    # duplicate: identical content was already stored (the revision's new
+    #            idempotency key is still registered, exactly as in the
+    #            single-event ingest).
+    status: Literal["accepted", "duplicate"]
+
+
+class PackageResponse(StrictModel):
+    """Result of a package upload (newly committed or an exact replay)."""
+
+    # accepted:  the package was committed by this request;
+    # duplicate: an identical package was already committed; the first-saved
+    #            result below is returned verbatim, even if single revisions
+    #            have arrived since.
+    status: Literal["accepted", "duplicate"]
+    batch_id: str
+    package_id: str
+    # Per-revision outcomes as committed by the first (accepted) request.
+    revisions: list[PackageRevisionStatus]
+    # Full batch result evaluated right after the package committed
+    # (timeline, gaps, counts and hashes).
+    result: BatchResult
+
+
 class PreviewChangeInterval(StrictModel):
     """One half-open span whose effective state/value/unit changes if submitted.
 
@@ -670,6 +753,7 @@ class ResetResponse(StrictModel):
     batches_removed: int
     events_removed: int
     seals_removed: int
+    packages_removed: int = 0
 
 
 class HealthResponse(StrictModel):

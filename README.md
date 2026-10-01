@@ -12,7 +12,10 @@
 **一组冗余传感器**做**可信多数投票（majority）**。出厂留档时还可把
 **已完成批次封存（seal）**为一份不可改写的证据快照：冻结当时全部修订与
 折叠结果并生成确定性证据摘要，之后可随时回查并核对实时批次是否仍与封存
-一致。修订、幂等键映射与封存证据默认保存在**持久化的 SQLite 存储**中，
+一致。针对**离线采集设备**，还支持把同一批次的多条修订打包为一次
+**原子整包回传（package）**：包内父子可乱序，整包要么全部提交要么全部
+拒绝，相同包 ID 的完全重试返回首次保存的结果。修订、幂等键映射、封存证据
+与包记录默认保存在**持久化的 SQLite 存储**中，
 服务重启后仍然保留，并可由同一数据库文件上的**多个服务进程共享**；
 也可通过配置切换回进程内存模式。可随时重置（重置会连同持久化数据一并
 清除并返回准确计数）。
@@ -35,7 +38,7 @@ docker compose up --build
 
 Compose 默认以 **2 个 uvicorn worker 进程**启动，二者通过同一个 SQLite
 数据库文件（WAL 模式，挂载在命名卷 `calibration-data` 上）共享全部状态：
-无论请求落到哪个进程，修订、幂等键与封存证据都一致；写入在 SQLite
+无论请求落到哪个进程，修订、幂等键、封存证据与包记录都一致；写入在 SQLite
 `BEGIN IMMEDIATE` 事务级串行，同一修订/幂等键的并发提交仍严格返回一个
 `accepted`、其余 `duplicate`（或负载冲突 `409`）。数据随命名卷保留，
 `docker compose restart` 或重建容器后不丢失；`docker compose down -v`
@@ -71,7 +74,8 @@ pytest -q
 > 测试套件默认强制使用内存后端（见 `tests/conftest.py` 中的
 > `CAL_STORAGE=memory`），不会在仓库里创建数据库；持久化行为由
 > `tests/test_persistence_sqlite.py` 单独覆盖（含两个真实 OS 进程共享、
-> 双 uvicorn worker 冒烟、重启后封存/幂等回放与存储故障 503）。
+> 双 uvicorn worker 冒烟、重启后封存/幂等/整包回放、并发整包回传与存储
+> 故障 503）。
 
 ---
 
@@ -91,11 +95,12 @@ pytest -q
 
 **存储语义：**
 
-- `sqlite`（默认）：修订、幂等键映射、封存证据全部落盘。服务重启或容器
+- `sqlite`（默认）：修订、幂等键映射、封存证据与整包回传记录全部落盘。服务重启或容器
   重建（保留数据卷）后仍可查询、重放；多个进程（如 `--workers N`）打开
   同一文件时共享同一份数据。每个写入接口在**一个 `BEGIN IMMEDIATE`
   事务**内完成“判定 + 写入 + 求值”，该事务同时是跨进程临界区：修订与
-  其幂等键映射原子提交；封存的“查重 → 校验 `timeline_hash`/完整性 →
+  其幂等键映射原子提交；整包回传的“查重 → 逐条冲突判定 → 整包写入 →
+  保存包记录 → 求值”与封存的“查重 → 校验 `timeline_hash`/完整性 →
   冻结证据 → 落库”也在同一事务内原子完成，并发提交无法插入其间。
   只读接口在同一快照事务内取数，预览读取的是同一时点的批次快照且不落
   任何数据。
@@ -129,6 +134,19 @@ pytest -q
   - 相同 `idempotency_key` 但负载不同（或同 `revision_id` 内容不同）→ `409 Conflict`；
   - 同一 `revision_id` + 相同内容即使换了幂等键也算重复，**新键会被登记**，
     修订与键映射在同一事务内原子保存。
+- **整包回传（package，见 4.1b）**：离线采集设备把同一批次的多条修订
+  打包为一次原子提交。包内父子可**乱序**，所有修订先整体合并，再按同一套
+  因果规则折叠；引用包外尚未上传的父版本照常列入 `gaps` 缺口。整包遵守
+  **全有或全无**：包内修订 ID 或幂等键重复、任一修订非法 → `422` 整包
+  拒绝；任一条与已存修订或幂等键负载冲突 → `409` 整包冲突；两种拒绝都
+  **不写入任何内容**（同事务回滚）。成功时逐条返回 `accepted`/`duplicate`
+  （与已存内容完全相同的修订按单条口径判 `duplicate`，其新键照常登记），
+  并带回提交后的完整批次结果（时间线哈希与缺口）。包级幂等以
+  `(batch_id, package_id)` 为键：相同包 ID + **完全相同内容**（修订集合
+  逐字段一致，列出顺序无关）的重试返回**首次保存的结果**
+  （`status="duplicate"`，即使此后又有单条修订使批次漂移、即使发生过
+  重启）；相同包 ID 换任何内容 → `409`。包记录随修订在同一事务内落库，
+  多进程并发回传同一包时恰好一个 `accepted`、其余 `duplicate`。
 - **提交预览（preview，见 4.2）**：传入与提交完全相同的负载，按相同的校验、
   幂等冲突与因果折叠规则计算，但**不写入任何事件、不占用幂等键、不创建批次**。
   预览返回本次为 `submittable`（可提交）还是 `duplicate`（重复）、预览前后的
@@ -255,6 +273,85 @@ pytest -q
 - 持久化后端下，多个进程并发提交同一修订/幂等键时，写入在一个
   `BEGIN IMMEDIATE` 事务内串行：恰好一个请求得到 `accepted`，相同负载的
   其余请求得到 `duplicate`，负载不同的得到 `409`；存储不可用返回 `503`。
+
+### `POST /api/v1/batches/{batch_id}/packages` — 整包回传多条测量片段修订
+
+离线采集设备一次回传同一批次的多条修订。请求体：
+
+```json
+{
+  "batch_id": "B42",
+  "package_id": "PKG-2026-001",
+  "revisions": [
+    {"sensor_id": "S1", "revision_id": "v2", "parent_id": "v1",
+     "idempotency_key": "e2", "start_ns": 100, "end_ns": 200,
+     "value": 3.5, "unit": "C"},
+    {"sensor_id": "S1", "revision_id": "v1", "parent_id": "ROOT",
+     "idempotency_key": "e1", "start_ns": 0, "end_ns": 300,
+     "value": 1.0, "unit": "C"}
+  ]
+}
+```
+
+说明：
+
+- 路径中的 `batch_id` 必须与请求体一致，否则 `422`；每条修订的批次由
+  包级 `batch_id` 统一指定，修订自身**不携带** `batch_id` 字段（多传按
+  多余字段 `422`）；每条修订的字段与校验规则和 4.1 的单条提交完全相同；
+- `revisions` 至少一条；包内父子可**任意顺序**列出，整包合并后再折叠；
+- 判定与写入在**一个事务（跨进程加锁）**内原子完成：
+  - 包内修订 ID 或幂等键重复、任一修订非法 → `422`，**整包拒绝且不写入**；
+  - 任一修订与已存修订或幂等键负载冲突 → `409`，**整包拒绝且不写入**；
+  - 否则整包提交，逐条返回 `accepted` / `duplicate`（与已存内容完全相同
+    的修订判 `duplicate`，其新幂等键照常登记，与单条提交口径一致）；
+- 响应 `200` 中 `status` 为 `accepted`（本次首次提交）/ `duplicate`
+  （完全相同内容的重试），并带回 `revisions`（逐条状态，按请求顺序）与
+  提交后的完整批次 `result`（时间线、缺口、计数与 `timeline_hash`）；
+- **包级幂等**（持久化存储中跨重启、跨进程同样生效）：相同
+  `(batch_id, package_id)` + 完全相同内容（修订集合逐字段一致，列出顺序
+  无关）→ 返回**首次保存的结果**（`status="duplicate"`），即使此后又有
+  单条修订使批次漂移；相同包 ID 换内容（含换幂等键、增删修订）→ `409`；
+- 多进程并发回传同一包时，写入在一个 `BEGIN IMMEDIATE` 事务内串行：
+  恰好一个请求得到 `accepted`，其余相同内容的请求得到内容一致的
+  `duplicate`；存储不可用返回 `503`。
+
+示例（包内子版本 v2 先于父版本 v1 列出，另有一条等待包外父版本 v9 的
+修订；整包仍提交，v9 照常列入缺口）：
+
+```bash
+$ curl -s -X POST localhost:8080/api/v1/batches/B42/packages \
+    -H 'Content-Type: application/json' \
+    -d '{"batch_id":"B42","package_id":"PKG-2026-001","revisions":[
+          {"sensor_id":"S1","revision_id":"v2","parent_id":"v1",
+           "idempotency_key":"e2","start_ns":100,"end_ns":200,"value":3.5,"unit":"C"},
+          {"sensor_id":"S1","revision_id":"v1","parent_id":"ROOT",
+           "idempotency_key":"e1","start_ns":0,"end_ns":300,"value":1.0,"unit":"C"},
+          {"sensor_id":"S1","revision_id":"v3","parent_id":"v9",
+           "idempotency_key":"e3","start_ns":10,"end_ns":20,"value":9.9,"unit":"C"}]}'
+{
+  "status": "accepted",
+  "batch_id": "B42",
+  "package_id": "PKG-2026-001",
+  "revisions": [
+    {"sensor_id": "S1", "revision_id": "v2", "idempotency_key": "e2", "status": "accepted"},
+    {"sensor_id": "S1", "revision_id": "v1", "idempotency_key": "e1", "status": "accepted"},
+    {"sensor_id": "S1", "revision_id": "v3", "idempotency_key": "e3", "status": "accepted"}
+  ],
+  "result": {
+    "batch_id": "B42",
+    "sensors": [ … v1/v2 已落地折叠，v3 被阻塞 … ],
+    "gaps": [
+      {"batch_id": "B42", "sensor_id": "S1", "missing_revision_id": "v9",
+       "awaited_by": ["v3"], "referenced_from": "v3"}
+    ],
+    "revisions_total": 3, "revisions_grounded": 2, "revisions_blocked": 1,
+    "revisions_invalid": 0, "complete": false,
+    "timeline_hash": "…"
+  }
+}
+# 完全相同内容重试（即使之后又有单条修订）-> "status":"duplicate"，
+# 返回首次保存的 result；同 package_id 换内容 -> 409。
+```
 
 ### `POST /api/v1/batches/{batch_id}/events:preview` — 提交前预览修订影响（不写入）
 
@@ -864,9 +961,10 @@ $ curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
 
 ### `POST /admin/reset` — 清空全部状态
 
-返回被清除的批次数、事件数与封存数（`seals_removed`）；在持久化后端下
-同样**删除数据库中的全部批次、幂等键映射与封存记录**（空库返回全 0，
-不报错）。批次数按出现过修订或封存的去重批次计。
+返回被清除的批次数、事件数、封存数（`seals_removed`）与整包回传记录数
+（`packages_removed`）；在持久化后端下同样**删除数据库中的全部批次、
+幂等键映射、封存与包记录**（空库返回全 0，不报错）。批次数按出现过修订、
+封存或包记录的去重批次计。
 
 ### `GET /health` — 存活检查
 
@@ -874,18 +972,20 @@ $ curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
 后端：持久化模式为 `"sqlite"`，内存模式为 `"memory"`。
 
 ```json
-{"status": "ok", "storage": "sqlite", "version": "2.0.0"}
+{"status": "ok", "storage": "sqlite", "version": "2.1.0"}
 ```
 
 ---
 
 ## 4b. 持久化存储说明（SQLite）
 
-- 数据库包含三张表：`events`（修订，主键 `(batch_id, revision_id)`）、
+- 数据库包含四张表：`events`（修订，主键 `(batch_id, revision_id)`）、
   `idempotency_keys`（幂等键 → 规范负载/修订，主键
   `(batch_id, idempotency_key)`）、`seals`（封存号 → 冻结证据 JSON 与
-  证据摘要，主键 `(batch_id, seal_id)`）。
-- 同一修订的“插入修订 + 登记幂等键”、封存的“校验 + 冻结 + 插入封存”
+  证据摘要，主键 `(batch_id, seal_id)`）、`packages`（包号 → 规范化内容
+  指纹与首次保存的响应 JSON，主键 `(batch_id, package_id)`）。
+- 同一修订的“插入修订 + 登记幂等键”、整包回传的“逐条判定 + 整包写入 +
+  保存包记录”、封存的“校验 + 冻结 + 插入封存”
   都在**单个事务**内提交，任何中途失败整体回滚，不会出现半成品状态。
 - 数据库运行在 **WAL** 日志模式（`synchronous=NORMAL`）：多个进程可同时
   读取，写入在库级互斥串行；等待锁的时长由 `CAL_SQLITE_BUSY_TIMEOUT_MS`
@@ -983,7 +1083,42 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/seals \
 
 # 10) 清空（持久化数据也一并删除）；返回准确计数
 curl -s -X POST localhost:8080/admin/reset
-#   -> {"status":"reset","batches_removed":N,"events_removed":M,"seals_removed":K}
+#   -> {"status":"reset","batches_removed":N,"events_removed":M,
+#       "seals_removed":K,"packages_removed":P}
+```
+
+### 整包回传示例（离线采集设备）
+
+```bash
+# 设备一次回传同一批次的多条修订；包内子版本 v2 可先于父版本 v1 列出，
+# 整包合并后再折叠；引用包外未上传的 v9 照常列入 gaps
+curl -s -X POST localhost:8080/api/v1/batches/B42/packages \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B42","package_id":"PKG-2026-001","revisions":[
+        {"sensor_id":"S1","revision_id":"v2","parent_id":"v1",
+         "idempotency_key":"e2","start_ns":100,"end_ns":200,"value":3.5,"unit":"C"},
+        {"sensor_id":"S1","revision_id":"v1","parent_id":"ROOT",
+         "idempotency_key":"e1","start_ns":0,"end_ns":300,"value":1.0,"unit":"C"},
+        {"sensor_id":"S1","revision_id":"v3","parent_id":"v9",
+         "idempotency_key":"e3","start_ns":10,"end_ns":20,"value":9.9,"unit":"C"}]}'
+#   -> status="accepted"，revisions 逐条 accepted，
+#      result.gaps 列出缺失的包外父版本 v9
+
+# 设备重试（网络重传，完全相同内容，列出顺序可不同）
+#   -> status="duplicate"，原样返回首次保存的 result，
+#      即使此间又有单条修订提交、即使服务已重启
+
+# 同 package_id 换内容（改值/换键/增删修订）-> 409，不写入
+
+# 包内修订 ID 或幂等键重复、任一修订非法 -> 422，整包不写入；
+# 任一修订与已存修订或幂等键负载冲突 -> 409，整包不写入
+
+# 包提交后，单条提交、预览、采样、封存等接口照常可用：
+curl -s -X POST localhost:8080/api/v1/batches/B42/events \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B42","sensor_id":"S1","revision_id":"v9","parent_id":"ROOT",
+       "idempotency_key":"e9","start_ns":0,"end_ns":30,"value":0.5,"unit":"C"}'
+#   -> 按缺口清单补传包外父版本，被阻塞的 v3 随之激活
 ```
 
 ### 多进程 / 重启持久化示例（默认 SQLite 后端）
@@ -1002,7 +1137,7 @@ curl -s localhost:8080/api/v1/batches/B1/result | jq .revisions_total   # -> 1
 # 同一请求在任一 worker 上重放都是 duplicate；新键重放同修订同内容登记新键
 # /health 的 storage 字段为 "sqlite"
 curl -s localhost:8080/health
-#   -> {"status":"ok","storage":"sqlite","version":"2.0.0"}
+#   -> {"status":"ok","storage":"sqlite","version":"2.1.0"}
 ```
 
 撤回某一段（墓碑，区间内被擦除）：
@@ -1022,12 +1157,12 @@ curl -s localhost:8080/health
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / majority / seals / reset / health（每个判定+求值包在单个 store 事务内）
+│   ├── main.py       # FastAPI 路由：ingest / packages / preview / result / sample / compare / quality-gate / release / majority / seals / reset / health（每个判定+求值包在单个 store 事务内）
 │   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、设备放行扫描、冗余传感器可信多数投票、批次封存证据与摘要、缺口与哈希（纯函数引擎）
-│   ├── storage.py    # 两种同构后端：线程安全的内存 EventStore 与持久化/多进程共享的 SqliteEventStore（WAL + BEGIN IMMEDIATE 跨进程事务），幂等判定、无副作用预览判定、不可改写封存记录与存储故障 StorageError
+│   ├── storage.py    # 两种同构后端：线程安全的内存 EventStore 与持久化/多进程共享的 SqliteEventStore（WAL + BEGIN IMMEDIATE 跨进程事务），幂等判定、无副作用预览判定、不可改写封存记录、整包回传记录与存储故障 StorageError
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置（CAL_STORAGE / CAL_SQLITE_PATH / CAL_SQLITE_BUSY_TIMEOUT_MS）
-├── tests/            # pytest（API 端到端 + 引擎单测 + SQLite 持久化/重启/跨进程/存储故障，共 207 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测 + SQLite 持久化/重启/跨进程/存储故障，共 229 个用例）
 ├── Dockerfile
 ├── docker-compose.yml  # 双 worker + 命名卷 calibration-data 共享 SQLite 数据库
 ├── requirements.txt
